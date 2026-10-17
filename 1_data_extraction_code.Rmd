@@ -1,0 +1,611 @@
+---
+title: "Data Extraction and Cohort Creation: PPI vs H2RA Survival Analysis"
+subtitle: "Analysis of Electronic Health Records — Stage 1"
+output: html_document
+date: "2026-03-19"
+---
+
+## Introduction
+
+This script performs data extraction and cohort preparation for a retrospective
+cohort study investigating the association between **proton pump inhibitor (PPI)**
+versus **H2 receptor antagonist (H2RA)** prescription and **all-cause mortality**,
+using simulated UK primary care electronic health record (EHR) data.
+
+**Pipeline stage:** 1 of 2 — run via `3_run_pipeline.R`
+
+---
+
+## Section 1: Data Import
+
+### Load libraries
+```{r}
+library(readr)
+library(tidyverse)
+library(dplyr)
+```
+
+### Import datasets
+```{r}
+setwd("~/0. LSHTM - ALL MODULES/9. AEHR/Assessment")
+
+# ---- Patient-level data files ----
+# Dynamically read all CSV files from the Assessment_sample directory
+# File naming convention: Sim_[TableName]_assessment_26.csv
+files <- list.files("Assessment_sample", full.names = TRUE, pattern = ".csv")
+filenames <- str_to_lower(str_remove(str_remove(tools::file_path_sans_ext(basename(files)), "_assessment"), "Sim_"))
+
+# Apply the read_csv function to all files and save the output as one big list
+data <- lapply(files, readr::read_csv)
+names(data) <- filenames
+
+# ---- Medical codelists ----
+# Read all codelist CSVs used to identify conditions and prescriptions
+files <- list.files("Codelists", full.names = TRUE, pattern = "codes.csv")
+filenames <- str_to_lower(str_remove(tools::file_path_sans_ext(basename(files)), "_codes"))
+
+# Apply the read_csv function to all files and save the output as one big list
+codes <- lapply(files, readr::read_csv)
+names(codes) <- filenames
+```
+
+### Data quality checks
+
+Verify data integrity: check for duplicate patients, gender distribution,
+event date ranges, and cross-table linkage.
+```{r}
+data$patient %>%
+  summarise(n_rows = n(),
+            n_patients = n_distinct(id))
+# one row per patient
+
+data$patient %>%
+  group_by(gender) %>%
+  summarise(n = n()) %>%
+  mutate(perc = prop.table(n))
+
+# more females than males in this dataset - something to bear in mind
+
+hist(data$contactdates$eventdate, "years")
+# all looks okay
+
+nrow(anti_join(data$patient, data$contactdates, by="id"))
+nrow(anti_join(data$contactdates, data$patient, by="id"))
+nrow(anti_join(data$clinic, data$contactdates, by="contactid"))
+```
+
+### Ensure categorical variables are factors
+```{r}
+
+factor_vars <- c("eth5", "contacttype", "ses_person", "gender")
+# For all datasets
+data <- map(data, ~.x %>% mutate(across(any_of(factor_vars), as_factor)))
+
+# Set explicit ordering for SES (deprivation quintile)
+data$ses$ses_person <- factor(data$ses$ses_person, levels = c("Least Deprived (1)", "2", "3", "4", "Most Deprived (5)"))
+levels(data$ses$ses_person)
+```
+
+---
+
+## Section 2: Study Design Overview
+
+#### Study aim
+To estimate the effect of proton pump inhibitor (PPI) prescription, versus a H2RA prescription, on subsequent all cause mortality.
+
+#### Eligibility criteria
+Patients whose records are held in our made-up database, who:
+
+- Have recorded year of birth, sex, and ethnicity
+- Have a first PPI or H2RA prescription that is:
+    - After the date of the patient's registration at the general practice plus one year
+    - Between 17 April 1997 and 17 April 2017
+
+#### Exposure
+PPI prescription versus H2RA prescription (first recorded prescription)
+
+#### Confounders
+- Age, sex, SES, calendar year of first prescription
+- GERD in the 6 months prior to prescription
+- Ethnicity, BMI
+- Gastric cancer prior to prescription
+- Peptic ulcer in the 6 months prior to prescription
+- Number of healthcare contacts in the year prior
+
+#### Follow-up
+For each patient, follow-up begins at the first prescription for PPI or H2RA and ends at the first of: death, end of study (17 April 2017), or transfer out of the general practice.
+
+#### Outcome
+All-cause mortality
+
+---
+
+## Section 3: Cohort Eligibility and Exposure Assignment
+
+### 3.1 Identify exposure groups and apply eligibility criteria
+```{r}
+# First label prescriptions with either PPI (1) or H2RA (0)
+ppis <- data$prescription %>% 
+  inner_join(codes$ppi, by="prescode") %>%
+  mutate(ppi=1)
+
+h2ras<- data$prescription %>% 
+  inner_join(codes$h2ra, by="prescode") %>%
+  mutate(ppi=0)
+
+ppis_h2ras<-rbind(ppis, h2ras)
+
+# Retain only the FIRST prescription per patient (index date)
+cohort <- ppis_h2ras %>%  
+  arrange(id, eventdate) %>%
+  filter(!duplicated(id))
+nrow(cohort)
+
+# Apply registration eligibility: prescription must be >1 year after practice registration
+cohort <- cohort %>% 
+  left_join(data$patient[c("id", "start")], by="id") %>% 
+  filter(eventdate > start+365.25) #
+nrow(cohort)
+
+# Apply study period eligibility: prescription between 17 Apr 1997 and 17 Apr 2017
+cohort <- cohort %>% 
+  filter(eventdate >= as.Date("1997-04-17") & eventdate <= as.Date("2017-04-17"))
+nrow(cohort)
+
+# Drop columns that aren't needed and rename eventdate to indexdate
+cohort <- cohort %>% 
+  select(id, eventdate,contactid, ppi) %>% 
+  rename(indexdate=eventdate)
+cohort
+
+# Check Sex/YOB/Ethnicity completeness for additional eligibility
+# NOTE: data$patient_26 may refer to a different naming convention in the data list;
+# these names are derived from the filename suffixes during import
+sum(is.na(data$patient_26$gender))
+sum(is.na(data$patient_26$yob))
+sum(is.na(data$patient_26$eth5))
+table(data$patient_26$eth5)
+table(data$patient_26$gender)
+hist(data$patient_26$yob)
+# no exclusions
+```
+
+### 3.2 Eligibility flowchart counts
+```{r}
+# The inbuilt library doesn't like adding exclusions that are 0
+# make the flowchart externally using calculated numbers
+table(cohort$ppi)
+```
+
+---
+
+## Section 4: Confounder Extraction
+
+### 4.1 Comorbidities (from clinical records)
+```{r}
+# 1. Diagnosis of gastric cancer EVER prior to index date
+# 2. Gastro-oesophageal reflux disease (GERD) in the 6 months prior to prescription
+# 3. Peptic ulcer in the 6 months prior to prescription
+
+# 1. Prior gastric cancer (ever before index date)
+gastric_cancer <- data$clinic %>% 
+  inner_join(codes$gastric_cancer, by="clincode") %>% 
+  arrange(id, eventdate) %>% 
+  filter(!duplicated(id)) %>% 
+  inner_join(cohort, by="id") %>% 
+  filter(eventdate < indexdate) %>% 
+  mutate(prior_gcancer=1) %>% 
+  select(id, prior_gcancer)
+
+# 2. Recent GERD (within 180 days before index date)
+recent_gerd <- data$clinic %>% 
+  inner_join(cohort, by="id") %>% 
+  arrange(id, eventdate) %>% 
+  inner_join(codes$gerd, by="clincode") %>% 
+  filter(eventdate>=indexdate-180 & eventdate<=indexdate) %>% 
+  filter(!duplicated(id)) %>% 
+  select(id) %>% 
+  mutate(recent_gerd=1) 
+
+# 3. Recent peptic ulcer (within 180 days before index date)
+recent_ulcer <- data$clinic %>% 
+  inner_join(cohort, by="id") %>% 
+  arrange(id, eventdate) %>% 
+  inner_join(codes$peptic_ulcer, by="clincode") %>% 
+  filter(eventdate>=indexdate-180 & eventdate<=indexdate) %>% 
+  filter(!duplicated(id)) %>% 
+  select(id) %>% 
+  mutate(recent_ulcer=1) 
+
+```
+
+### 4.2 Exploratory analysis: Prescription patterns and treatment switching
+
+This section investigates prescription characteristics (quantity, daily dose,
+duration, strength) and treatment switching between PPI and H2RA groups. This
+is exploratory analysis to understand the data rather than part of the primary
+analysis pipeline.
+```{r}
+# ---- Prescription characteristics ----
+oac_all_prescriptions <- data$prescription %>%
+  inner_join(codes$oac, by="prescode") 
+ppi_all_prescriptions <- data$prescription %>%
+  inner_join(codes$ppi, by="prescode")  
+h2ra_all_prescriptions <- data$prescription %>%
+  inner_join(codes$h2ra, by="prescode") 
+# Quantity
+par(mfrow=c(3,1))
+hist(oac_all_prescriptions$qty, xlim=c(0,200), breaks = 200)
+hist(ppi_all_prescriptions$qty, xlim=c(0,200), breaks = 200)
+hist(h2ra_all_prescriptions$qty, xlim=c(0,200), breaks = 200)
+
+oac_all_prescriptions %>%
+  group_by(qty) %>%
+  summarise(n = n()) %>%
+  mutate(perc = prop.table(n))
+
+ppi_all_prescriptions %>%
+  group_by(qty) %>%
+  summarise(n = n()) %>%
+  mutate(perc = prop.table(n))
+
+h2ra_all_prescriptions %>%
+  group_by(qty) %>%
+  summarise(n = n()) %>%
+  mutate(perc = prop.table(n))
+
+# Daily dose
+oac_all_prescriptions %>%
+  group_by(daily_dose) %>%
+  summarise(n = n()) %>%
+  mutate(perc = prop.table(n))
+
+ppi_all_prescriptions %>%
+  group_by(daily_dose) %>%
+  summarise(n = n()) %>%
+  mutate(perc = prop.table(n))
+
+h2ra_all_prescriptions %>%
+  group_by(daily_dose) %>%
+  summarise(n = n()) %>%
+  mutate(perc = prop.table(n))
+
+# Duration (calculated as quantity / daily dose)
+oac_all_prescriptions <- oac_all_prescriptions %>%
+  mutate(duration=ifelse(daily_dose==0, NA, qty/daily_dose))
+ppi_all_prescriptions <- ppi_all_prescriptions %>%
+  mutate(duration=ifelse(daily_dose==0, NA, qty/daily_dose))
+h2ra_all_prescriptions <-h2ra_all_prescriptions %>%
+  mutate(duration=ifelse(daily_dose==0, NA, qty/daily_dose))
+
+par(mfrow=c(3,1))
+hist(oac_all_prescriptions$duration, xlim=c(0,200), breaks = 200)
+hist(ppi_all_prescriptions$duration, xlim=c(0,200), breaks = 200)
+hist(h2ra_all_prescriptions$duration, xlim=c(0,200), breaks = 200)
+
+# Strength
+table(oac_all_prescriptions$strength)
+table(ppi_all_prescriptions$strength)
+table(h2ra_all_prescriptions$strength)
+
+#----------------------------------------------------------------------
+# ---- Treatment persistence and switching ----
+# Important for understanding potential misclassification of exposure
+
+# PPI group: count subsequent PPI prescriptions per patient
+ppi_group <- cohort %>% 
+    filter(ppi==1) %>%
+  select(ppi, id, indexdate)
+
+# Pick out all PPI prescriptions given to patients in the ppi_group on or after study entry and count per patient
+num_subs_ppi<-ppi_group %>% 
+  inner_join(ppi_all_prescriptions, by="id") %>%
+  filter(eventdate>=indexdate) %>%
+  group_by(id) %>%
+  summarise(n_presc=sum(ppi))
+
+# Tabulate
+num_subs_ppi %>%
+  mutate(group_n_presc=ifelse(n_presc<10, n_presc, 10)) %>%
+  group_by(group_n_presc) %>%
+  summarise(n = n())%>%
+  mutate(perc = prop.table(n))
+
+# Plot
+hist(num_subs_ppi$n_presc, breaks = 0:max(num_subs_ppi$n_presc))
+
+# Same for H2RA group
+h2ra_group <- cohort %>% 
+  filter(ppi==0) %>%
+  select(ppi, id, indexdate)
+
+num_subs_h2ra<-h2ra_group %>% 
+  inner_join(h2ra_all_prescriptions, by="id") %>%
+  filter(eventdate>=indexdate) %>%
+  mutate(h2ra=1) %>%
+  group_by(id) %>%
+  summarise(n_presc=sum(h2ra))
+
+#Tabulate
+num_subs_h2ra %>%
+  mutate(group_n_presc=ifelse(n_presc<10, n_presc, 10)) %>%
+  group_by(group_n_presc) %>%
+  summarise(n = n())%>%
+  mutate(perc = prop.table(n))
+
+# Plot
+hist(num_subs_h2ra$n_presc, breaks = 0:max(num_subs_h2ra$n_presc))
+
+# ---- Treatment switching ----
+# Identify patients who switched from PPI to H2RA (or vice versa) after index date
+
+# PPI -> H2RA switchers
+ppi_switchers<-ppi_group %>% 
+  inner_join(h2ra_all_prescriptions, by="id") %>%
+  filter(eventdate>indexdate) %>%
+  arrange(id, eventdate) %>%
+  filter(!duplicated(id)) %>%
+  mutate(yrs_to_switch=as.numeric(eventdate-indexdate)/365.25) %>%
+  rename(date_switch=eventdate) %>%
+  select(id, ppi, yrs_to_switch, date_switch)
+
+# Proportion who switched in PPI group
+ppi_group %>% 
+    full_join(ppi_switchers, by="id")  %>%
+    mutate(switch=ifelse(is.na(yrs_to_switch), 0, 1)) %>%
+    group_by(switch) %>%
+    summarise(n = n())%>%
+    mutate(perc = prop.table(n))
+# Plot time to treatment switch (among those who do switch)
+hist(ppi_switchers$yrs_to_switch)
+
+# H2RA -> PPI switchers
+h2ra_switchers<-h2ra_group %>% 
+  inner_join(ppi_all_prescriptions, by="id") %>%
+  filter(eventdate>indexdate) %>%
+  arrange(id, eventdate) %>%
+  filter(!duplicated(id)) %>%
+  mutate(yrs_to_switch=as.numeric(eventdate-indexdate)/365.25) %>%
+  rename(date_switch=eventdate) %>%
+  select(id, ppi, yrs_to_switch, date_switch)
+
+# Proportion who switched in H2RA group
+h2ra_group %>% 
+  full_join(h2ra_switchers, by="id")  %>%
+  mutate(switch=ifelse(is.na(yrs_to_switch), 0, 1)) %>%
+  group_by(switch) %>%
+  summarise(n = n())%>%
+  mutate(perc = prop.table(n))
+
+# Plot time to switch (for those who switch)
+hist(h2ra_switchers$yrs_to_switch)
+
+# Store switching information for later use in defining censoring/follow-up
+switchers <- rbind(ppi_switchers, h2ra_switchers)
+switchers <- switchers %>% 
+  select(!yrs_to_switch)
+```
+
+### 4.3 Demographics: BMI
+
+BMI is derived from two sources: (1) directly recorded BMI values, and
+(2) calculated from weight and height measurements. Both sources are restricted
+to the 5 years prior to the index date. Extreme values outside plausible ranges
+are excluded.
+
+#### i) BMI from recorded values
+```{r}
+
+# BMI data entered directly (entity 17, data3 = BMI)
+
+bmi_data <- data$clinic %>% 
+  filter(entity==17) %>% 
+  rename(bmi_date=eventdate) %>%
+  inner_join(cohort, by="id") %>%
+  inner_join(data$other, by= c("id", "entity", "otherid"))  %>% 
+  rename(bmi=data3) %>%
+  filter(between(as.numeric(indexdate-bmi_date), 0, 5*365.25)) %>% 
+  filter(!is.na(bmi), between(bmi, 9, 129)) %>% 
+  group_by(id, bmi_date) %>%
+  summarize(bmi = mean(bmi)) %>% 
+  arrange(id, bmi_date) %>% 
+  ungroup() %>%
+  group_by(id)  %>%
+  filter(bmi_date == max(bmi_date)) %>%
+  mutate(preference=2) %>% 
+  select(id, bmi, bmi_date, preference)
+
+# Weight data (entity 17, data1 = weight in kg)
+
+weight_data <- data$clinic %>% 
+  filter(entity ==17) %>%  
+  rename(weight_date=eventdate) %>%
+  inner_join(cohort, by="id") %>%
+  inner_join(data$other, by= c("id", "entity", "otherid"))  %>% 
+  rename(weight_kg=data1) %>% 
+  filter(between(as.numeric(indexdate-weight_date), 0, 5*365.25)) %>% 
+  filter(!is.na(weight_kg), between(weight_kg, 25, 635)) %>%
+  group_by(id, weight_date)  %>%
+  summarize(weight_kg = mean(weight_kg)) %>% 
+  arrange(id, weight_date) %>% 
+  ungroup() %>%
+  group_by(id)  %>%
+  filter(weight_date == max(weight_date)) %>% 
+  select(id, weight_kg, weight_date)
+
+# Height data (entity 18, data1 = height in metres)
+height_data <- data$clinic %>% 
+  filter(entity == 18) %>%
+  rename(height_date = eventdate) %>%
+  inner_join(cohort, by = "id") %>%
+  inner_join(data$other, by = c("id", "entity", "otherid")) %>%
+  rename(height_m = data1) %>%
+  filter(!is.na(height_m), between(height_m, 1.20, 2.15)) %>%
+  group_by(id, height_date) %>%
+  summarize(height_m = mean(height_m), .groups = "drop") %>%
+  group_by(id) %>%
+  filter(height_date == max(height_date)) %>%
+  ungroup() %>%
+  select(id, height_m, height_date)
+
+#--------------------------------------------
+# Combine weight and height to calculate BMI (preference=1, preferred over recorded)
+bmi_calculate <- inner_join(height_data, weight_data, by = "id") %>%
+  mutate(
+    bmi = weight_kg / height_m^2,
+    bmi_date = weight_date,
+    preference = 1
+  ) %>%
+  filter(between(bmi, 9, 129)) %>%
+  select(id, bmi, bmi_date, preference)
+
+# Combine both BMI sources, preferring calculated (preference=1) over recorded (preference=2)
+bmi_combined <- bind_rows(bmi_data, bmi_calculate) %>%
+  group_by(id) %>%
+  arrange(preference, desc(bmi_date)) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  select(id, bmi, bmi_date, preference)
+
+# Coverage summary: how many cohort patients have BMI data?
+cohort_bmi_check <- cohort %>%
+  select(id) %>%
+  mutate(
+    has_recorded_bmi   = id %in% bmi_data$id,
+    has_calculated_bmi = id %in% bmi_calculate$id,
+    has_any_bmi        = id %in% bmi_combined$id
+  )
+
+# Check exclusions
+cat("Total patients in cohort:", nrow(cohort_bmi_check), "\n")
+cat("Patients with recorded BMI:", sum(cohort_bmi_check$has_recorded_bmi), "\n")
+cat("Patients with calculated BMI:", sum(cohort_bmi_check$has_calculated_bmi), "\n")
+cat("Patients with ANY valid BMI:", sum(cohort_bmi_check$has_any_bmi), "\n")
+cat("Patients with NO valid BMI:", sum(!cohort_bmi_check$has_any_bmi), "\n")
+cat("% coverage:", round(mean(cohort_bmi_check$has_any_bmi) * 100, 1), "%\n")
+```
+
+#### ii) Age, calendar year, sex, SES, ethnicity
+```{r}
+demographics <- cohort %>% 
+  left_join(data$patient, by="id") %>%
+  left_join(data$ses, by="id") %>% 
+  mutate(age=round(as.numeric(indexdate-as.Date(paste0(yob, "-06-15")))/365.25),
+         calendarperiod=case_when(indexdate<as.Date("2000-01-01") ~ "1997-1999",
+                                  indexdate<as.Date("2005-01-01") ~ "2000-2004",
+                                  indexdate<as.Date("2010-01-01") ~ "2005-2009",
+                                  indexdate<as.Date("2015-01-01") ~ "2010-2014",
+                                  indexdate>=as.Date("2015-01-01") ~ "2015-2017")) %>% 
+  rename(pracid=pracid.x) %>%
+  select(id, pracid, age, gender, ses_person, calendarperiod, eth5)
+demographics
+```
+
+
+#### iii) Number of healthcare contacts in the year prior to index date
+```{r}
+# Explore contact type data
+# NOTE: data$contactdates_26 refers to the imported name from filename convention
+unique(data$contactdates_26$contacttype)
+sum(is.na(data$contactdates_26$contacttype))
+
+# Define eligible contact types (face-to-face and telephone consultations)
+eligible_contacts <- c("Surgery consultation", 
+                        "Follow-up/routine visit", 
+                        "Clinic", 
+                        "Telephone call from a patient", 
+                        "Acute visit", 
+                        "Home Visit", 
+                        "Emergency Consultation")
+
+# Count contacts per patient in the 365 days before the index date
+no_contacts <- data$contact %>%
+  inner_join(cohort, by = "id") %>%
+  filter(contacttype %in% eligible_contacts) %>%
+  filter(eventdate >= indexdate - 365 & eventdate < indexdate) %>%
+  group_by(id) %>%
+  summarize(n_contacts = n(), .groups = "drop")
+
+# Left join to cohort so patients with zero contacts get a 0 instead of NA
+no_contacts <- cohort %>%
+  select(id) %>%
+  left_join(no_contacts, by = "id") %>%
+  mutate(n_contacts = ifelse(is.na(n_contacts), 0, n_contacts))
+
+hist(no_contacts$n_contacts)
+```
+
+---
+
+## Section 5: Follow-up Time and Outcome
+
+Define the end of follow-up for each patient as the earliest of: death, transfer
+out of practice, or study end date (17 April 2017). Treatment switching dates
+are also recorded for potential sensitivity analyses.
+```{r}
+enddates <- cohort %>% 
+  left_join(data$patient, by="id") %>% 
+  mutate(enddate=pmin( 
+    as.Date("2017-04-17"),
+    pmin(leavepractice, deathdate, na.rm = TRUE),
+    na.rm = TRUE),
+    died=ifelse(is.na(deathdate), 0, (deathdate==enddate))) %>% 
+  select(id, deathdate, enddate, died)
+enddates
+
+# Merge switching information
+enddates <- enddates %>% 
+  left_join(switchers[c("id", "date_switch")], by="id") 
+enddates
+
+# Check how many patients have no switch date (i.e. did not switch treatment)
+sum(is.na(enddates$date_switch))
+```
+
+---
+
+## Section 6: Final Merged Analysis Dataset
+
+Merge all extracted variables into a single analysis-ready dataset.
+```{r}
+# check if cleaning required
+analysis_data <- cohort %>% 
+  left_join(gastric_cancer, by="id") %>% 
+  left_join(recent_gerd, by="id") %>% 
+  left_join(recent_ulcer, by="id") %>% 
+  left_join(enddates, by="id") %>% 
+  left_join(demographics, by="id") %>% 
+  left_join(no_contacts, by="id") %>% 
+  left_join(bmi_combined, by="id") %>% 
+  mutate(across(.cols = c("prior_gcancer", "recent_gerd", "recent_ulcer"),
+                .fns = ~ ifelse(is.na(.x), 0, 1)))
+analysis_data
+
+# Check for missing values and NAs
+# Overall missingness summary
+cat("Total patients:", nrow(analysis_data), "\n\n")
+
+# Count NAs in each column
+na_summary <- analysis_data %>%
+  summarize(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = round(n_missing / nrow(analysis_data) * 100, 1)) %>%
+  arrange(desc(n_missing))
+
+print(na_summary)
+```
+
+### Remove patients with missing BMI
+
+Patients without any valid BMI measurement (recorded or calculated within 5 years
+of their index date) are excluded from the analysis.
+```{r}
+analysis_data <- analysis_data[!is.na(analysis_data$bmi), ]
+```
+
+---
+
+## Section 7: Export Final Dataset
+```{r}
+saveRDS(analysis_data, file = "analysis_data.Rds")
+```

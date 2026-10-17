@@ -1,0 +1,34 @@
+# ============================================================
+# .gitignore for EHR Survival Analysis Project
+# ============================================================
+
+# --- Data files (too large / simulated assessment data) ---
+Assessment_sample/
+analysis_data.Rds
+
+# --- R session files ---
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# --- R Markdown output ---
+*.html
+*_files/
+*_cache/
+
+# --- Assessment/university admin files ---
+1. Assessment details/
+3. Report/
+LSHTM Assessment Cover Sheet*.dot
+LSHTM Assessment Cover Sheet*.pdf
+Flowchart.docx
+Lists.txt
+
+# --- Word documents in formatted figures ---
+2. Figures/Formatted/
+
+# --- OS files ---
+Thumbs.db
+.DS_Store
+desktop.ini
